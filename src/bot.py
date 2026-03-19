@@ -25,7 +25,7 @@ from src.dex.price_feed import Opportunity, PriceFeed
 from src.dex.uniswap_v2 import UniswapV2Client
 from src.dex.uniswap_v3 import UniswapV3Client
 from src.strategy.arbitrage import ArbitrageStats, ArbitrageStrategy
-from src.utils.helpers import setup_logging
+from src.utils.helpers import from_wei, setup_logging
 
 logger = logging.getLogger("sniper")
 
@@ -50,10 +50,36 @@ def build_clients(
     return v2, v3
 
 
+def check_wallet_balance(w3: Web3, address: str, config: Config) -> None:
+    """Log the wallet's native-token balance and warn if it is low."""
+    balance_wei = w3.eth.get_balance(address)
+    balance = from_wei(balance_wei)
+    symbol = config.native_symbol
+    recommended = config.min_recommended_balance
+    logger.info(
+        "Wallet balance: %.6f %s  (recommended minimum: %.1f %s)",
+        balance,
+        symbol,
+        recommended,
+        symbol,
+    )
+    if balance < recommended:
+        logger.warning(
+            "⚠️  Wallet balance (%.6f %s) is below the recommended minimum "
+            "of %.1f %s for %s. Top up your wallet before running the bot "
+            "to ensure it can cover trade amounts and gas fees.",
+            balance,
+            symbol,
+            recommended,
+            symbol,
+            config.network,
+        )
+
+
 def log_stats(stats: ArbitrageStats) -> None:
     logger.info(
         "Session stats – attempted=%d succeeded=%d failed=%d "
-        "net_profit=%.6f ETH gas_spent=%.6f ETH",
+        "net_profit=%.6f gas_spent=%.6f (native token)",
         stats.trades_attempted,
         stats.trades_succeeded,
         stats.trades_failed,
@@ -65,6 +91,7 @@ def log_stats(stats: ArbitrageStats) -> None:
 def run_once(
     price_feed: PriceFeed,
     strategy: ArbitrageStrategy,
+    native_symbol: str = "ETH",
 ) -> None:
     """Perform a single scan-and-execute cycle."""
     logger.debug("Starting scan cycle …")
@@ -84,11 +111,12 @@ def run_once(
     for result in results:
         if result.success:
             logger.info(
-                "✅ Trade succeeded – token=%s buy=%s sell=%s profit≈%.6f ETH",
+                "✅ Trade succeeded – token=%s buy=%s sell=%s profit≈%.6f %s",
                 result.opportunity.token[:10],
                 result.buy_tx_hash,
                 result.sell_tx_hash,
                 result.estimated_profit_eth,
+                native_symbol,
             )
         elif result.error:
             logger.debug("⚠️  Trade skipped/failed: %s", result.error)
@@ -100,11 +128,13 @@ def main() -> None:
     logger.info("🚀 Liquidity Sniper Bot starting …")
 
     config = Config()
+    logger.info("Network: %s", config.network.upper())
     w3 = build_web3(config)
     v2, v3 = build_clients(config, w3)
 
     wallet = w3.eth.account.from_key(config.private_key)
     logger.info("Wallet: %s", wallet.address)
+    check_wallet_balance(w3, wallet.address, config)
 
     price_feed = PriceFeed(config, v2, v3)
     strategy = ArbitrageStrategy(config, w3, v2, v3, wallet.address)
@@ -120,15 +150,16 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _stop)
 
     logger.info(
-        "Monitoring %d token(s) every %ds. Min profit: %.4f ETH.",
+        "Monitoring %d token(s) every %ds. Min profit: %.4f %s.",
         len(config.watched_tokens),
         config.poll_interval_seconds,
         config.min_profit_eth,
+        config.native_symbol,
     )
 
     while running:
         try:
-            run_once(price_feed, strategy)
+            run_once(price_feed, strategy, config.native_symbol)
         except Exception as exc:  # noqa: BLE001
             logger.error("Unexpected error in scan cycle: %s", exc, exc_info=True)
         time.sleep(config.poll_interval_seconds)
